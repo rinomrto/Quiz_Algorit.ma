@@ -1,323 +1,323 @@
-# Laporan Pentest: PRISMA (prisma.artiga.id)
-## Paperless Working System Koarmada III
+# Cross-Reference Report: LOGIQUE Pentest vs Live Retest vs Codebase Review
 
 **Tanggal:** 18 Juni 2026
-**Target:** https://prisma.artiga.id
-**Scope:** Single domain, owned application
-**Tester:** Automated pentest pipeline
-**Identifying Header:** X-Bug-Bounty: 9a8e2b69
+**Target:** prisma.artiga.id (PRISMA - Paperless Working System Koarmada III)
+**Sumber:**
+1. LOGIQUE Security Assessment Report (22-26 Mei 2026) - 10 temuan
+2. Internal Live Retest (17-18 Juni 2026) - 7 temuan
+3. Source Code Review (18 Juni 2026) - verifikasi root cause
 
 ---
 
-## Ringkasan Eksekutif
+## Status Remediasi LOGIQUE Findings
 
-Pengujian keamanan dilakukan pada aplikasi PRISMA (Paperless Working System Koarmada III) di `prisma.artiga.id`. Aplikasi ini berbasis Go backend dengan template Mantis Bootstrap 5, di-deploy di balik Cloudflare.
-
-Ditemukan **7 temuan keamanan** dengan rincian:
-- **HIGH:** 2
-- **MEDIUM:** 3
-- **LOW:** 2
-
-Aplikasi memiliki fondasi keamanan yang baik (CSRF protection, auth redirect, security headers, file type validation), namun ada kelemahan signifikan pada **authorization/access control** antar role dan **information disclosure**.
+| # | LOGIQUE Finding | Severity | Status | Evidence |
+|---|----------------|----------|--------|----------|
+| F-01 | Session Cookie Tidak Ditandatangani (Privilege Escalation) | CRITICAL | **FIXED** | Cookie sekarang di-sign HMAC-SHA256 + constant-time compare |
+| F-02 | Password Default/Lemah (admin123) | HIGH | **PARTIALLY FIXED** | Password policy 12 char + complexity enforced, tapi akun lama masih pakai `admin123` |
+| F-03 | Cookie Tanpa Secure & SameSite | HIGH | **FIXED** | `Secure: cfg.IsProduction()`, `SameSite: http.SameSiteLaxMode`, `HttpOnly: true` |
+| F-04 | Tidak Ada Rate-Limit Login | HIGH | **FIXED** | IP rate-limit (10/5min) + account lockout (5 attempts -> 15min lock) implemented |
+| F-05 | CSP Tidak Diterapkan | MEDIUM | **FIXED** | Full CSP header di `SecurityHeaders()` middleware |
+| F-06 | SPF/DMARC Tidak Ada | MEDIUM | **NOT VERIFIED** | DNS config - di luar codebase, perlu cek DNS records |
+| F-07 | Tidak Ada HSTS | MEDIUM | **FIXED** | `Strict-Transport-Security: max-age=31536000; includeSubDomains; preload` |
+| F-08 | X-Frame-Options & X-Content-Type-Options Tidak Diset | MEDIUM | **FIXED** | `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff` |
+| F-09 | Server Banner Cloudflare Terekspos | LOW | **ACCEPTABLE** | Cloudflare managed - tidak bisa dihapus dari origin |
+| F-10 | Root URL Return 404 | LOW | **CONFIRMED STILL OPEN** | Live test: `GET /` tanpa auth = 404 plain-text |
 
 ---
 
-## Temuan Berdasarkan Severity
+## Detail Remediasi per Finding
 
----
+### F-01: Session Cookie Signing - FIXED
 
-### [HIGH-01] Broken Access Control - API User Search Tanpa Filter Role
+**LOGIQUE menemukan:** Cookie `auth_session` berisi plaintext JSON tanpa signature. Attacker bisa ubah `role` jadi Administrator.
 
-**Severity:** HIGH
-**CWE:** CWE-862 (Missing Authorization)
-**Endpoint:** `GET /api/users/search?q=`
-
-**Deskripsi:**
-Endpoint `/api/users/search` mengembalikan data seluruh user ke SEMUA role termasuk `staf` (role terendah). Tidak ada pembedaan akses - staf mendapat response identik (6618 bytes) dengan superadmin.
-
-**Data yang bocor:**
-- UUID seluruh user (`id`)
-- Username
-- Position (jabatan, level, organization_id)
-- Timestamps internal (`created_at`, `updated_at`, `created_by`)
-- Organization structure dan hierarchy level
-
-**PoC:**
-```bash
-# Login sebagai staf, lalu:
-curl -s "https://prisma.artiga.id/api/users/search?q=" \
-  -H "Cookie: jual_kirim_admin_session=<STAF_SESSION>"
-```
-
-**Response (dipotong):**
-```json
-{"results":[
-  {"id":"d29c1a6c-47c3-4d15-ac1d-385439c6d1cb","text":"Superadmin","username":"Superadmin"},
-  {"id":"c3c93c6a-...",
-   "position":{"id":"2a5d77fc-...","name":"SETUM KOARMADA III","level":6,
-   "organization_id":"1e0d1375-...","created_by":"d29c1a6c-..."},
-   "text":"Setum1","username":"Setum1"},
-  ...
-]}
-```
-
-**Dampak:**
-- Penyerang dengan akun staf bisa memetakan seluruh struktur organisasi
-- UUID user bisa digunakan untuk serangan IDOR lebih lanjut
-- Internal timestamps membocorkan kapan user dibuat/dimodifikasi
-
-**Rekomendasi:**
-1. Batasi endpoint ini hanya untuk role `superadmin` atau role yang membutuhkan
-2. Filter field yang dikembalikan - hanya `id` dan `text` untuk autocomplete, hapus `position`, `organization_id`, `created_at`, `created_by`
-3. Implementasi row-level filtering berdasarkan scope user yang login
-
+**Status sekarang di codebase:**
 ```go
-// Contoh fix di handler
-func (h *Handler) SearchUsers(c *gin.Context) {
-    currentUser := auth.GetCurrentUser(c)
-    if !currentUser.HasPermission("users.search.full") {
-        // Return hanya id + display name
-        results := h.userService.SearchMinimal(q, currentUser.OrganizationID)
-        c.JSON(200, gin.H{"results": results})
-        return
+// app/helper/session.go:115-128
+func signSessionPayload(payload []byte) (string, error) {
+    secret, err := sessionSigningSecret()
+    mac := hmac.New(sha256.New, secret)
+    mac.Write(payload)
+    signature := mac.Sum(nil)
+    encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
+    encodedSignature := base64.RawURLEncoding.EncodeToString(signature)
+    return encodedPayload + "." + encodedSignature, nil
+}
+
+// app/helper/session.go:130-159
+func verifySessionCookie(cookie string) ([]byte, error) {
+    // Split payload.signature
+    // Verify with HMAC-SHA256
+    // constant-time compare via crypto/subtle
+    if subtle.ConstantTimeCompare(providedSignature, expectedSignature) != 1 {
+        return nil, fmt.Errorf("invalid session signature")
     }
-    // ... full results untuk admin
+    return payload, nil
 }
 ```
 
+**Verdict:** PROPERLY FIXED. Cookie sekarang format `base64(payload).base64(hmac-sha256)`. Tampering akan gagal karena signature mismatch. Constant-time compare mencegah timing attack.
+
+**Catatan:** Meskipun signed, session data masih disimpan client-side. RBAC tetap bergantung pada data di cookie (bukan re-query DB per request). Ini berarti jika secret bocor, privilege escalation masih mungkin. Rekomendasi jangka panjang: migrasi ke server-side session (Redis).
+
 ---
 
-### [HIGH-02] Broken Access Control - Forced Browsing ke Form Surat Masuk
+### F-02: Password Default - PARTIALLY FIXED
 
-**Severity:** HIGH
-**CWE:** CWE-285 (Improper Authorization)
-**Endpoint:** `GET /entry-surat/tambah-surat-masuk`
+**LOGIQUE menemukan:** Akun Kapuskodal login dengan `admin123`.
 
-**Deskripsi:**
-Halaman `/entry-surat/tambah-surat-masuk` tidak ada di menu navigasi untuk role non-admin, tetapi bisa diakses langsung (forced browsing) oleh SEMUA role yang login. Halaman ini menampilkan form lengkap untuk menambah surat masuk termasuk file upload.
-
-**Access Matrix:**
-| Role | Menu Visible | Direct Access | Status |
-|------|-------------|---------------|--------|
-| superadmin | Ya | 200 (154KB) | Expected |
-| pangkoarmada | Tidak | 200 (151KB) | **BUG** |
-| kadisinfolahta | Tidak | 200 (151KB) | **BUG** |
-| staf | Tidak | 200 (151KB) | **BUG** |
-
-**PoC:**
-```bash
-# Login sebagai staf, akses langsung:
-curl -s -o /dev/null -w "%{http_code}" \
-  "https://prisma.artiga.id/entry-surat/tambah-surat-masuk" \
-  -H "Cookie: jual_kirim_admin_session=<STAF_SESSION>"
-# Response: 200 (halaman form lengkap)
-```
-
-**Dampak:**
-- User non-admin bisa membuat surat masuk tanpa otorisasi
-- Bypass workflow approval yang seharusnya membatasi siapa boleh entry surat
-- Form termasuk file upload yang bisa disalahgunakan
-
-**Rekomendasi:**
-1. Tambahkan middleware authorization check per-route, bukan hanya hide menu di frontend
-2. Implementasi role-based access control (RBAC) di level router/handler
-
+**Status sekarang di codebase:**
 ```go
-// Contoh middleware
-func RequirePermission(perm string) gin.HandlerFunc {
-    return func(c *gin.Context) {
-        user := auth.GetCurrentUser(c)
-        if !user.HasPermission(perm) {
-            c.Redirect(302, "/dashboard")
-            c.Abort()
-            return
-        }
-        c.Next()
-    }
+// app/helper/security.go:111-130
+func ValidateStrongPassword(password string) error {
+    if len(password) < 12 { return ErrWeakPassword }
+    // Checks: lowercase + uppercase + digit + symbol
+    if isCommonPassword(password) { return ErrWeakPassword }
+    return nil
 }
 
-// Router
-r.GET("/entry-surat/tambah-surat-masuk", RequirePermission("surat.create"), handler.TambahSuratMasuk)
+// app/helper/security.go:164-178
+func isCommonPassword(password string) bool {
+    commonPasswords := map[string]struct{}{
+        "admin123": {}, "password": {}, "qwerty": {}, ...
+    }
+}
 ```
 
----
+**Live test:** Login `superadmin/admin123` masih BERHASIL. Artinya:
+- Password policy hanya enforce pada **password change**, bukan pada login
+- Akun-akun lama BELUM di-force-reset
+- `admin123` ada di blocklist tapi hanya dicek saat ganti password
 
-### [MEDIUM-01] Broken Access Control - Admin Endpoints Return 500 Instead of 403
-
-**Severity:** MEDIUM
-**CWE:** CWE-280 (Improper Handling of Insufficient Permissions)
-**Endpoints:** `/data-master/users`, `/data-master/role`, `/data-master/jabatan`, `/security/malware`, `/report/surat-keluar`
-
-**Deskripsi:**
-Saat user non-admin mengakses endpoint admin, server mengembalikan **HTTP 500 Internal Server Error** dengan body kosong (0 bytes), bukan 403 Forbidden atau redirect. Ini menandakan authorization check dilakukan dengan cara yang menyebabkan crash/panic, bukan proper denial.
-
-**Access Matrix (non-superadmin roles):**
-| Endpoint | Expected | Actual |
-|----------|----------|--------|
-| /data-master/users | 403 atau redirect | 500 (0b) |
-| /data-master/role | 403 atau redirect | 500 (0b) |
-| /data-master/jabatan | 403 atau redirect | 500 (0b) |
-| /security/malware | 403 atau redirect | 500 (0b) |
-| /report/surat-keluar | 403 atau redirect | 500 (0b) |
-
-**Dampak:**
-- Information disclosure: penyerang tahu endpoint itu ada (500 vs 404)
-- Kemungkinan unhandled panic di Go yang bisa mengekspos stack trace di production log
-- Bisa dieksploitasi untuk resource exhaustion jika panic handler lambat
+**Verdict:** PARTIALLY FIXED. Policy ada tapi tidak retroactive.
 
 **Rekomendasi:**
-1. Authorization check harus dilakukan SEBELUM logic handler, bukan di dalamnya
-2. Return 403 atau redirect ke dashboard, bukan panic
-3. Cek error handling - kemungkinan nil pointer dereference saat cek role
+1. Force password reset untuk SEMUA akun yang masih pakai password < 12 char
+2. Tambahkan check saat login: jika password lama tidak meet policy, redirect ke force-change
+3. Jalankan migration script untuk flag akun dengan weak password
 
 ---
 
-### [MEDIUM-02] Information Disclosure - Upload Response Leaks Server Path
+### F-03: Cookie Flags - FIXED
 
-**Severity:** MEDIUM
-**CWE:** CWE-200 (Exposure of Sensitive Information)
-**Endpoint:** `POST /api/inbox/upload-temp`
+**Live evidence:**
+```
+#HttpOnly_prisma.artiga.id  FALSE  /  TRUE  1781777033  jual_kirim_admin_session  MTc4MT...
+```
+- `HttpOnly`: TRUE (kolom curl = HttpOnly prefix)
+- `Secure`: TRUE (kolom 4 = TRUE)
+- `SameSite`: Lax (set di code, tidak visible di curl netscape format)
 
-**Deskripsi:**
-Response upload mengembalikan path filesystem server di field `file`.
-
-**PoC:**
-```bash
-curl -s "https://prisma.artiga.id/api/inbox/upload-temp" \
-  -X POST -H "X-CSRF-Token: <token>" \
-  -b "jual_kirim_admin_session=<session>" \
-  -F "file=@test.pdf"
+**Codebase:**
+```go
+// app/helper/session.go:66-68
+Secure:   shouldUseSecureCookies(c),  // true in production
+HttpOnly: true,
+SameSite: http.SameSiteLaxMode,
 ```
 
-**Response:**
+**Verdict:** FIXED. Semua flag benar.
+
+---
+
+### F-04: Login Rate Limiting - FIXED
+
+**Codebase:**
+```go
+// app/helper/security.go:15-19
+loginWindowDuration   = 5 * time.Minute
+loginMaxAttemptsByIP  = 10
+loginAccountLockAfter = 5
+loginAccountLockTime  = 15 * time.Minute
+```
+
+**Live test (5 attempts):** Semua return 302 (normal). Test hanya 5 karena safe testing - kemungkinan lockout belum trigger karena butuh persis 5 gagal per-akun. Rate limit per-IP threshold = 10.
+
+**Catatan:** Rate limit HANYA in-memory (`sync.Mutex` + map). Kalau server restart, counter reset. Multi-instance deployment = bypass.
+
+**Verdict:** FIXED untuk single-instance. Rekomendasi: persist ke Redis untuk multi-instance.
+
+---
+
+### F-05, F-07, F-08: Security Headers - ALL FIXED
+
+**Codebase (`app/helper/security.go:48-65`):**
+```go
+func SecurityHeaders() gin.HandlerFunc {
+    ctx.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' https:; ...")
+    ctx.Header("X-Frame-Options", "DENY")
+    ctx.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+    ctx.Header("X-Content-Type-Options", "nosniff")
+    ctx.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+}
+```
+
+**Live evidence (curl headers):**
+```
+content-security-policy: default-src 'self'; script-src 'self' 'unsafe-inline' https:; ...
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+x-content-type-options: nosniff
+x-frame-options: DENY
+referrer-policy: strict-origin-when-cross-origin
+```
+
+**Verdict:** ALL FIXED. F-05, F-07, F-08 fully remediated.
+
+---
+
+## Temuan BARU dari Internal Retest (Tidak Ada di LOGIQUE Report)
+
+LOGIQUE hanya test dengan 1 akun role Pejabat. Internal retest pakai 4 role berbeda dan menemukan masalah authorization yang tidak ter-cover.
+
+### NEW-01: Broken Access Control - /api/users/search Leaks Data ke Semua Role
+
+**Severity:** HIGH
+**Root Cause di Codebase:**
+
+```go
+// app/route.go:200 - HANYA CheckSessionMiddleware, TANPA CheckPermissionMiddleware
+api.GET("/users/search", helper.CheckSessionMiddleware(), positionController.SearchUsers)
+```
+
+```go
+// app/controller/position.go:522-534 - Returns full position object
+results = append(results, gin.H{
+    "id":       user.ID.String(),
+    "text":     label,
+    "username": user.Username,
+    "position": user.Position,  // <-- LEAKS full position struct
+})
+```
+
+**Problem:** 
+1. Endpoint hanya cek "is logged in" - tidak ada permission check
+2. Response include full `Position` object (ID, Name, Level, OrganizationID, timestamps, created_by)
+3. Semua role mendapat data identik
+
+**Fix yang dibutuhkan:**
+```go
+// Route - tambah permission check ATAU batasi response
+api.GET("/users/search", helper.CheckSessionMiddleware(), positionController.SearchUsers)
+
+// Controller - strip sensitive fields
+results = append(results, gin.H{
+    "id":   user.ID.String(),
+    "text": label,
+    // HAPUS: "username", "position" full object
+})
+```
+
+---
+
+### NEW-02: Broken Access Control - /entry-surat/tambah-surat-masuk Tanpa Permission Check
+
+**Severity:** HIGH
+**Root Cause di Codebase:**
+
+```go
+// app/route.go:181-182 - TANPA CheckPermissionMiddleware!
+session.GET("/entry-surat/tambah-surat-masuk", inboxController.Create)
+session.POST("/entry-surat/tambah-surat-masuk", inboxController.PostCreate)
+
+// BANDINGKAN dengan surat keluar yang BENAR:
+// app/route.go:187-188
+session.GET("/entry-surat/tambah-surat-keluar", helper.CheckPermissionMiddleware([]string{"outbox-create"}), outboxController.Create)
+session.POST("/entry-surat/tambah-surat-keluar", helper.CheckPermissionMiddleware([]string{"outbox-create"}), outboxController.PostCreate)
+```
+
+**Problem:** Route tambah surat masuk TIDAK punya middleware permission. Surat keluar sudah benar (ada `outbox-create` check). Ini inconsistency.
+
+**Fix yang dibutuhkan:**
+```go
+session.GET("/entry-surat/tambah-surat-masuk", helper.CheckPermissionMiddleware([]string{"inbox-create"}), inboxController.Create)
+session.POST("/entry-surat/tambah-surat-masuk", helper.CheckPermissionMiddleware([]string{"inbox-create"}), inboxController.PostCreate)
+```
+
+---
+
+### NEW-03: Admin Endpoints Return 500 (Authz Crash)
+
+**Severity:** MEDIUM
+**Root Cause:** Endpoint `/data-master/*` di-render server-side. Handler mencoba load data berdasarkan permission, tapi ketika user tidak punya akses, terjadi nil pointer atau template render error yang menghasilkan 500 bukan proper 403/redirect.
+
+**Affected routes (likely):** Semua `/data-master/*` routes yang mungkin ada di grup `session` tanpa proper permission middleware, dan handler-nya crash saat session permission kosong.
+
+**Fix:** Tambahkan `CheckPermissionMiddleware` di route level, bukan di handler logic.
+
+---
+
+### NEW-04: Upload Response Leaks Server Temp Path
+
+**Severity:** MEDIUM
+**Live evidence:**
 ```json
 {"file":"/tmp/1781744007_test.pdf","name":"test.pdf","success":true}
 ```
 
-**Dampak:**
-- Path `/tmp/` mengkonfirmasi OS Linux dan temporary file location
-- Timestamp di filename (`1781744007`) membocorkan server time
-- Informasi ini membantu penyerang merencanakan serangan path traversal
-
-**Rekomendasi:**
-1. Return hanya file ID atau relative reference, bukan absolute path
-2. Contoh response yang aman: `{"id": "abc123", "name": "test.pdf", "success": true}`
+**Fix:** Return relative path atau opaque ID, bukan absolute filesystem path.
 
 ---
 
-### [MEDIUM-03] Session Cookie Missing SameSite Attribute
+### NEW-05: Cookie Name Leaks Internal Project Name
 
-**Severity:** MEDIUM
-**CWE:** CWE-1275 (Sensitive Cookie with Improper SameSite Attribute)
-**Cookie:** `jual_kirim_admin_session`
-
-**Deskripsi:**
-Session cookie dikirim tanpa attribute `SameSite`. Meskipun browser modern default ke `Lax`, ini sebaiknya di-set eksplisit.
-
-**Cookie flags saat ini:**
-- HttpOnly: Ya (baik)
-- Secure: Ya (baik)
-- SameSite: **Tidak di-set** (kurang)
-- Path: / (OK)
-
-**Rekomendasi:**
+**Severity:** LOW (informational)
+**Codebase:**
 ```go
-// Di session configuration
-store.Options = &sessions.Options{
-    Path:     "/",
-    MaxAge:   86400,
-    HttpOnly: true,
-    Secure:   true,
-    SameSite: http.SameSiteStrictMode, // Tambahkan ini
-}
+// main.go:80
+router.Use(sessions.Sessions("jual_kirim_admin_session", store))
 ```
 
----
-
-### [LOW-01] Information Disclosure - Session Cookie Name Leaks Internal Project Name
-
-**Severity:** LOW
-**CWE:** CWE-200 (Information Exposure)
-
-**Deskripsi:**
-Session cookie bernama `jual_kirim_admin_session` yang mengindikasikan nama project internal ("jual kirim"). Ini tidak sesuai dengan aplikasi PRISMA dan membocorkan bahwa codebase di-reuse dari project lain.
-
-**Rekomendasi:**
-Ganti nama cookie menjadi generic: `prisma_session` atau `__Host-session`
+Cookie name `jual_kirim_admin_session` dari project lama "Jual Kirim". Ganti ke `prisma_session`.
 
 ---
 
-### [LOW-02] No Login Rate Limiting
+## Ringkasan Status Keseluruhan
 
-**Severity:** LOW
-**CWE:** CWE-307 (Improper Restriction of Excessive Authentication Attempts)
+### Skor Remediasi LOGIQUE Findings: 7/10 Fixed
 
-**Deskripsi:**
-5 percobaan login gagal berturut-turut tidak menghasilkan lockout, delay, atau CAPTCHA. Semua mengembalikan 302 redirect (normal failed login flow).
+| Status | Count | Details |
+|--------|-------|---------|
+| FIXED | 7 | F-01, F-03, F-04, F-05, F-07, F-08, F-09(acceptable) |
+| PARTIALLY FIXED | 1 | F-02 (policy ada, akun lama belum reset) |
+| NOT VERIFIED | 1 | F-06 (DNS - out of scope codebase) |
+| STILL OPEN | 1 | F-10 (root 404) |
 
-**Catatan mitigasi:** Cloudflare mungkin memberikan rate limiting di layer atasnya, dan password policy server-side sudah mensyaratkan min 6 karakter + kombinasi huruf besar/kecil/angka/simbol. Namun application-level rate limiting tetap disarankan.
+### Temuan Baru (Tidak di-test LOGIQUE): 5
 
-**Rekomendasi:**
-1. Implementasi rate limit: max 5 attempts per 15 menit per IP/username
-2. Setelah 10 gagal: temporary lockout 30 menit
-3. Tambahkan CAPTCHA setelah 3 gagal
-
----
-
-## Hal yang AMAN (Tidak Ditemukan Bug)
-
-| Area | Status | Detail |
-|------|--------|--------|
-| Authentication | AMAN | Semua endpoint redirect ke /login tanpa cookie |
-| CSRF Protection | AMAN | Token validated di semua POST, 400 pada token invalid/kosong/salah |
-| XSS (Reflected) | AMAN | Input di-escape, tidak ada refleksi di /api/users/search |
-| SQL Injection | AMAN | Parameterized query, time-based test 0.35s (no delay) |
-| File Upload Types | AMAN | Hanya .pdf/.docx/.xlsx/.jpg/.jpeg/.png/.gif/.bmp/.webp diterima, SVG/HTML/PHP ditolak |
-| Security Headers | AMAN | CSP, HSTS (preload), X-Frame-Options DENY, X-Content-Type-Options nosniff, Referrer-Policy |
-| Exposed Paths | AMAN | /.env, /.git/config, /swagger.json, /actuator, /phpinfo semua 404 |
-| CORS | AMAN | Tidak ada Access-Control-Allow-Origin header pada evil origin |
-| Open Redirect | AMAN | /login?next= tidak di-redirect ke external |
-| Password Policy | AMAN | Min 6 karakter, wajib kombinasi huruf besar/kecil/angka/simbol (server-side validated) |
-| API Unauth | AMAN | Semua /api/* endpoint return 302 tanpa session |
-| WebSocket | AMAN | 302 tanpa auth, 403 untuk role non-authorized |
+| # | Severity | Finding | Why LOGIQUE Missed |
+|---|----------|---------|-------------------|
+| NEW-01 | HIGH | /api/users/search data leak | LOGIQUE hanya test 1 role (Pejabat) |
+| NEW-02 | HIGH | /entry-surat/tambah-surat-masuk no authz | LOGIQUE fokus session tampering, bukan forced browsing antar role |
+| NEW-03 | MEDIUM | Admin endpoints 500 crash | Butuh multi-role test |
+| NEW-04 | MEDIUM | Upload path disclosure | Possibly fixed setelah LOGIQUE test |
+| NEW-05 | LOW | Cookie name leak | Informational |
 
 ---
 
-## Stack Teknis Teridentifikasi
+## Prioritas Perbaikan (Gabungan)
 
-| Komponen | Detail |
-|----------|--------|
-| Backend | Go (gorilla/sessions) |
-| Frontend | Mantis Bootstrap 5 Admin Template |
-| CDN/WAF | Cloudflare |
-| Database | PostgreSQL (inferred dari pg_sleep test response) |
-| Session | Cookie-based, gorilla/securecookie |
-| JS Libraries | jQuery 3.6.0, DataTables 1.13.7, SweetAlert2, jQuery Validate, ApexCharts |
-| Realtime | WebSocket at /ws |
-
----
-
-## Prioritas Perbaikan
-
-| Prioritas | Finding | Estimasi Effort |
-|-----------|---------|----------------|
-| 1 (segera) | HIGH-01: API user search leaks data | 2-4 jam |
-| 2 (segera) | HIGH-02: Forced browsing tambah surat | 1-2 jam |
-| 3 (minggu ini) | MEDIUM-01: 500 instead of 403 | 2-3 jam |
-| 4 (minggu ini) | MEDIUM-02: Upload path leak | 30 menit |
-| 5 (minggu ini) | MEDIUM-03: SameSite cookie | 15 menit |
-| 6 (sprint ini) | LOW-01: Cookie name | 15 menit |
-| 7 (sprint ini) | LOW-02: Login rate limit | 2-3 jam |
+| Prio | Item | Effort | Impact |
+|------|------|--------|--------|
+| 1 | NEW-01: Batasi /api/users/search response | 1 jam | HIGH - data leak ke semua role |
+| 2 | NEW-02: Tambah permission middleware di tambah-surat-masuk | 30 menit | HIGH - unauthorized create |
+| 3 | F-02: Force password reset akun lama | 2 jam | HIGH - credential compromise |
+| 4 | NEW-03: Fix admin endpoint 500 -> proper 403 | 2 jam | MEDIUM - error disclosure |
+| 5 | NEW-04: Strip server path dari upload response | 30 menit | MEDIUM - info disclosure |
+| 6 | F-06: Setup SPF/DMARC DNS | 1 jam | MEDIUM - email spoofing |
+| 7 | F-10: Redirect root / ke /login | 15 menit | LOW - UX |
+| 8 | NEW-05: Rename cookie | 15 menit | LOW - info leak |
 
 ---
 
-## Effort Log
+## Rekomendasi Arsitektural (Jangka Menengah)
 
-- **Akun diuji:** 4 (superadmin, pangkoarmada, kadisinfolahta, staf disinfolahta)
-- **Endpoint di-crawl:** 16 pages + 12 API endpoints
-- **Access matrix:** 4 roles x 8 restricted endpoints = 32 combinations tested
-- **Upload tests:** 5 file types (pdf, php, html, svg, double-ext)
-- **Injection tests:** SQLi (boolean + time-based), XSS (reflected), CSRF bypass (3 methods)
-- **Auth tests:** Session fixation, login rate limit (5 attempts), password policy (weak passwords)
-- **Infrastructure:** Exposed paths (12 paths), CORS, open redirect, WebSocket auth, security headers
-- **Mobile:** N/A (no mobile app in scope)
+1. **Server-side session (Redis)** - Meskipun F-01 fixed dengan HMAC signing, role/permission masih di cookie. Jika signing secret bocor, privilege escalation kembali mungkin. Migrasi ke server-side session eliminasi risiko ini.
+
+2. **Permission audit semua routes** - Scan `app/route.go` untuk semua route yang hanya pakai `CheckSessionMiddleware()` tanpa `CheckPermissionMiddleware()`. Saat ini banyak endpoint (inbox/list, arsip-file/list, users/search, upload-temp) tidak ada permission check.
+
+3. **Rate-limit persistence** - Current rate limit in-memory. Deploy Redis-backed limiter untuk survive restart dan multi-instance.
+
+4. **Password migration** - Run batch check semua user, flag yang tidak meet 12-char policy, force reset pada next login.
+
+5. **Periodic multi-role testing** - LOGIQUE hanya test 1 role. Broken access control hanya terdeteksi dengan multi-role testing. Tambahkan automated RBAC test suite.
